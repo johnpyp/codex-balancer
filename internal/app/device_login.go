@@ -57,7 +57,7 @@ func loginWithDeviceCode(ctx context.Context, hc *http.Client, out io.Writer, is
 		return nil, err
 	}
 
-	fmt.Fprintf(out, deviceAuthPrompt, issuer, deviceAuthTimeout/time.Minute, device.userCode, trainingSettingNotice(ctx))
+	fmt.Fprintf(out, deviceAuthPrompt, issuer, deviceAuthTimeout/time.Minute, device.userCode, trainingSettingNotice())
 	return completeDeviceAuthorization(ctx, hc, issuer, device)
 }
 

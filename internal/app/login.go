@@ -89,7 +89,7 @@ func login(ctx context.Context, hc *http.Client) (*Account, error) {
 	defer server.Shutdown(context.Background())
 
 	link := authorizeURL(challengeFor(verifier), state)
-	fmt.Fprintf(os.Stderr, "%s\n\nOpening your browser to sign in.\nIf nothing opens, visit:\n\n%s\n\nIf the callback does not open, paste its full URL here:\n", trainingSettingNotice(ctx), link)
+	fmt.Fprintf(os.Stderr, "%s\n\nOpening your browser to sign in.\nIf nothing opens, visit:\n\n%s\n\nIf the callback does not open, paste its full URL here:\n", trainingSettingNotice(), link)
 	openBrowser(link)
 	go acceptPastedCallbacks(os.Stdin, os.Stderr, flow)
 

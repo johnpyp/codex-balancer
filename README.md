@@ -63,10 +63,11 @@ codex-balancer accounts add --device-auth
 codex-balancer accounts list
 ```
 
-Enrollment disables ChatGPT model training before adding the account. If you have
-already disabled it and the settings update is rejected, you can explicitly use
-`accounts add --device-auth --training-already-disabled`. That flag skips the
-update; it does not verify the existing setting.
+Enrollment checks the account's current model-training setting. If training is
+already disabled, it adds the account without sending an opt-out update. If
+training is enabled, it disables training before adding the account. Browser,
+device, and web enrollment use this same flow; no manual bypass flag is needed.
+If the setting cannot be read or the required update fails, enrollment stops.
 
 ## Connect Codex
 

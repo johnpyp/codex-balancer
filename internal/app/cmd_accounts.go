@@ -17,7 +17,7 @@ import (
 const accountsHelp = `Manage the account pool.
 
 Usage:
-  codex-balancer accounts add                 Sign in, disable training, and pool the account
+  codex-balancer accounts add                 Sign in, ensure training is off, and pool the account
   codex-balancer accounts add --device-auth   Do the same with a code on another device
   codex-balancer accounts list                Show pooled accounts
   codex-balancer accounts mode <account> <mode> Set routing to normal or priority
@@ -26,7 +26,6 @@ Usage:
 Flags:
   -state string      state database (default %s)
   -device-auth       sign in with a one-time code, add only
-  -training-already-disabled  keep the training setting you already disabled, add only
   -json              machine-readable output, list only
 `
 
@@ -44,15 +43,11 @@ func accountsCmd(args []string) error {
 	fs.Usage = func() { printAccountsHelp(os.Stderr) }
 	path := fs.String("state", defaultStatePath(), "state database")
 	deviceAuth := fs.Bool("device-auth", false, "sign in with a one-time code")
-	trainingDisabled := fs.Bool("training-already-disabled", false, "confirm training is already disabled; skip the settings update")
 	asJSON := fs.Bool("json", false, "machine-readable output")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
 
-	if *trainingDisabled && args[0] != "add" {
-		return errors.New("-training-already-disabled applies only to accounts add")
-	}
 	store, err := openStateStore(*path)
 	if err != nil {
 		return err
@@ -65,7 +60,7 @@ func accountsCmd(args []string) error {
 
 	switch args[0] {
 	case "add":
-		return addAccount(pool, *deviceAuth, *trainingDisabled)
+		return addAccount(pool, *deviceAuth)
 	case "list":
 		return listAccounts(pool, *asJSON)
 	case "mode":
@@ -104,12 +99,9 @@ func accountsCmd(args []string) error {
 	return fmt.Errorf("unknown subcommand %q", args[0])
 }
 
-func addAccount(pool *Pool, deviceAuth bool, trainingDisabled bool) error {
+func addAccount(pool *Pool, deviceAuth bool) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
-	if trainingDisabled {
-		ctx = context.WithValue(ctx, trainingAlreadyDisabledKey{}, true)
-	}
 
 	var account *Account
 	var err error
