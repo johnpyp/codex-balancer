@@ -1,0 +1,24 @@
+.DS_Store
+/codex-balancer
+/dist/
+*.test
+*.out
+
+# Local credentials, state, and deployment artifacts
+.env
+.env.*
+!.env.example
+.codex-balancer/
+auth.json
+client-access.json
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.log
+*.log.*
+*.pem
+*.key
+/backups/

@@ -1,0 +1,273 @@
+package app
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"log/slog"
+	"net/http"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+const (
+	maxWebSocketMessage  = 64 << 20
+	maxUpstreamErrorBody = 64 << 10
+	refreshTimeout       = 30 * time.Second
+	upstreamWait         = 90 * time.Second
+)
+
+func newProxyClient() *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.ResponseHeaderTimeout = upstreamWait
+	return &http.Client{Transport: transport}
+}
+
+type server struct {
+	ctx              context.Context
+	pool             *Pool
+	catalog          *modelCatalog
+	prices           *priceCatalog
+	stats            *Stats
+	logins           accountLoginStore
+	upstream         string
+	authIssuer       string
+	lookupAPIKey     func(string) (string, bool, error)
+	client           *http.Client
+	log              *slog.Logger
+	admission        *admissionGate
+	resources        *resourceMonitor
+	countries        countryResolver
+	dashboardStreams atomic.Int64
+	dashboardUpdates dashboardBroadcaster
+	routeOwnership   sync.Mutex
+	routeClaims      routeClaimRegistry
+	activeWebSockets activeWebSocketRegistry
+}
+
+var webSocketExcludedHeaders = map[string]bool{
+	"accept-encoding":          true,
+	"authorization":            true,
+	"chatgpt-account-id":       true,
+	"connection":               true,
+	"content-length":           true,
+	"cookie":                   true,
+	"host":                     true,
+	"keep-alive":               true,
+	"proxy-authenticate":       true,
+	"proxy-authorization":      true,
+	"sec-websocket-accept":     true,
+	"sec-websocket-extensions": true,
+	"sec-websocket-key":        true,
+	"sec-websocket-protocol":   true,
+	"sec-websocket-version":    true,
+	"te":                       true,
+	"trailer":                  true,
+	"transfer-encoding":        true,
+	"upgrade":                  true,
+}
+
+func (s *server) routes() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/dashboard", http.StatusPermanentRedirect)
+	})
+	mux.HandleFunc("GET /accounts", s.accountsPage)
+	mux.HandleFunc("GET /accounts/status", s.accountLoginStatus)
+	mux.HandleFunc("GET /dashboard/assets/accounts.css", webAsset("web/accounts.css", "text/css; charset=utf-8", "public, max-age=31536000, immutable"))
+	mux.HandleFunc("GET /dashboard/assets/accounts.js", webAsset("web/accounts.js", "text/javascript; charset=utf-8", "public, max-age=31536000, immutable"))
+	mux.HandleFunc("GET /dashboard", s.dashboardPage)
+	mux.HandleFunc("GET /favicon.svg", webAsset("web/favicon.svg", "image/svg+xml", "public, max-age=3600"))
+	mux.HandleFunc("GET /dashboard/assets/dashboard.js", webAsset("web/dashboard.js", "text/javascript; charset=utf-8", "public, max-age=31536000, immutable"))
+	mux.HandleFunc("GET /dashboard/assets/htmx-2.0.10.min.js", webAsset("web/htmx-2.0.10.min.js", "text/javascript; charset=utf-8", "public, max-age=31536000, immutable"))
+	mux.HandleFunc("GET /dashboard/assets/idiomorph-0.7.4.min.js", webAsset("web/idiomorph-0.7.4.min.js", "text/javascript; charset=utf-8", "public, max-age=31536000, immutable"))
+	mux.HandleFunc("GET /dashboard/assets/sse-2.2.4.min.js", webAsset("web/sse-2.2.4.min.js", "text/javascript; charset=utf-8", "public, max-age=31536000, immutable"))
+	mux.HandleFunc("GET /dashboard/events", s.dashboardEvents)
+	mux.HandleFunc("GET /stats", s.statsJSON)
+	mux.HandleFunc("GET /v1/models", s.models)
+	// All provider-relative HTTP surfaces share authentication and account affinity.
+	// Responses/Guardian WebSockets retain the event-aware relay; other upgrades
+	// and HTTP endpoints use the transparent streaming proxy.
+	mux.Handle("/v1/", s.admitted(s.providerRequest))
+	// This alias preserves Codex's backend-API request shape selection (notably
+	// realtime SDP/session creation) while retaining /v1 client compatibility.
+	mux.Handle("/backend-api/codex/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		forward := r.Clone(r.Context())
+		forward.URL.Path = "/v1/" + strings.TrimPrefix(r.URL.Path, "/backend-api/codex/")
+		if r.URL.RawPath != "" {
+			forward.URL.RawPath = "/v1/" + strings.TrimPrefix(r.URL.RawPath, "/backend-api/codex/")
+		}
+		mux.ServeHTTP(w, forward)
+	}))
+	return mux
+}
+
+func (s *server) models(w http.ResponseWriter, r *http.Request) {
+	if _, authorized := s.authorizeAPIKey(r); !authorized {
+		writeError(w, http.StatusUnauthorized, "missing or invalid bearer key")
+		return
+	}
+	clientVersion := strings.TrimSpace(r.URL.Query().Get("client_version"))
+	if clientVersion != "" {
+		ctx := r.Context()
+		if s.ctx != nil {
+			ctx = s.ctx
+		}
+		if err := s.refreshModels(ctx, clientVersion); err != nil && s.log != nil {
+			s.log.Warn("model refresh failed", "error", err)
+		}
+	}
+	models := []modelEntry{}
+	if s.catalog != nil {
+		models = s.catalog.entries()
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if clientVersion != "" {
+		json.NewEncoder(w).Encode(map[string]any{"models": models})
+		return
+	}
+	data := make([]map[string]any, 0, len(models))
+	for _, model := range models {
+		data = append(data, map[string]any{
+			"id":       modelSlug(model),
+			"object":   "model",
+			"owned_by": "openai",
+		})
+	}
+	json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": data})
+}
+
+type responseReasoning struct {
+	Effort string `json:"effort"`
+}
+
+type responseErrorPayload struct {
+	Type string `json:"type"`
+	Code string `json:"code"`
+}
+
+func responseError(resp *http.Response) responseErrorPayload {
+	original := resp.Body
+	prefix, _ := io.ReadAll(io.LimitReader(original, maxUpstreamErrorBody))
+	resp.Body = struct {
+		io.Reader
+		io.Closer
+	}{
+		Reader: io.MultiReader(bytes.NewReader(prefix), original),
+		Closer: original,
+	}
+	var envelope struct {
+		Error responseErrorPayload `json:"error"`
+	}
+	if json.Unmarshal(prefix, &envelope) != nil {
+		return responseErrorPayload{}
+	}
+	return envelope.Error
+}
+
+func responseUsageLimitReached(resp *http.Response) bool {
+	err := responseError(resp)
+	return err.Type == "usage_limit_reached" || err.Code == "usage_limit_reached"
+}
+
+func workspaceUsageLimitReached(headers http.Header) bool {
+	return strings.HasPrefix(strings.ToLower(headers.Get("x-codex-rate-limit-reached-type")), "workspace_")
+}
+
+func (s *server) refreshed(account *Account, id string) bool {
+	s.log.Debug("refreshing account", "account", id)
+	ctx, cancel := context.WithTimeout(context.Background(), refreshTimeout)
+	defer cancel()
+	if err := account.refresh(ctx, s.client, s.pool.persistAccountState); err != nil {
+		s.log.Warn("refresh failed", "account", id, "error", err)
+		if account.needsReauth() {
+			s.invalidateAccount(id, routingReasonOwnerSignedOut)
+		}
+		return false
+	}
+	s.log.Debug("account refreshed", "account", id)
+	return true
+}
+
+func (s *server) invalidateAccount(account string, reason routingReason) {
+	s.routeOwnership.Lock()
+	defer s.routeOwnership.Unlock()
+	invalidatedAt := time.Now()
+	claims := s.routeClaims.invalidateAccount(account)
+	sockets := s.activeWebSockets.closeAccount(account, string(reason))
+	if len(claims.keys) > 0 && s.pool != nil && s.pool.store != nil {
+		if err := s.pool.store.preserveRouteOwners(invalidatedAt, account, claims.keys); err != nil {
+			s.log.Warn("provisional route owner preservation failed", "account", account, "routing_reason", reason, "routes", claims.keys, "error", err)
+		}
+	}
+	if claims.claims == 0 && sockets == 0 {
+		return
+	}
+	s.log.Info("account websocket routing invalidated",
+		"account", account,
+		"routing_reason", reason,
+		"provisional_claims", claims.claims,
+		"closed_websockets", sockets,
+	)
+}
+
+func copyWebSocketHeaders(dst, src http.Header) {
+	connection := map[string]bool{}
+	for _, value := range src.Values("Connection") {
+		for token := range strings.SplitSeq(value, ",") {
+			connection[strings.ToLower(strings.TrimSpace(token))] = true
+		}
+	}
+	for name, values := range src {
+		lower := strings.ToLower(name)
+		if webSocketExcludedHeaders[lower] || connection[lower] {
+			continue
+		}
+		dst[name] = values
+	}
+}
+
+type apiKeyIdentity struct {
+	name   string
+	suffix string
+}
+
+func (s *server) authorizeAPIKey(r *http.Request) (apiKeyIdentity, bool) {
+	if s.lookupAPIKey == nil {
+		return apiKeyIdentity{}, true
+	}
+	presented := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	name, valid, err := s.lookupAPIKey(presented)
+	if err != nil {
+		if s.log != nil {
+			s.log.Error("API key lookup failed", "error", err)
+		}
+		return apiKeyIdentity{}, false
+	}
+	if !valid {
+		return apiKeyIdentity{}, false
+	}
+	return apiKeyIdentity{name: name, suffix: tokenSuffix(presented)}, true
+}
+
+func tokenSuffix(token string) string {
+	if len(token) <= 3 {
+		return token
+	}
+	return token[len(token)-3:]
+}
+
+func writeError(w http.ResponseWriter, status int, message string) {
+	writeJSON(w, status, map[string]any{
+		"error": map[string]string{"message": message, "type": "balancer_error"},
+	})
+}
+
+func writeJSON(w http.ResponseWriter, status int, value any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(value)
+}
