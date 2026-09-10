@@ -11,6 +11,34 @@ examples cleaned up for this repository. The initial publication uses a fresh
 history without local deployment records. The upstream [MIT license](LICENSE)
 and third-party asset licenses are retained.
 
+## Differences from upstream
+
+Compared with upstream commit `dcd4d957`:
+
+- **Streaming HTTP support:** Responses and Guardian endpoints accept HTTP/SSE
+  as well as WebSockets, sharing the pool's account selection and usage tracking.
+- **Broader provider forwarding:** Other `/v1/*` HTTP requests and WebSocket
+  upgrades pass through to the configured backend, including compaction, search,
+  images, memories, and realtime paths. The `/backend-api/codex/*` alias preserves
+  Codex's backend-specific request shapes.
+- **Additional account-state protection:** HTTP requests retain existing session
+  ownership, and WebSocket account changes reject encrypted reasoning,
+  compaction, and item references bound to the original account.
+- **Native-login integration and keyless listener checks:** Codex can keep its
+  built-in OpenAI provider and ChatGPT login while using the pool. Keyless access
+  validates both the configured bind address and the actual systemd listener;
+  non-loopback access requires an explicit client network policy.
+- **Reloadable network allowlist:** `-client-access-config` restricts every route
+  by socket-peer CIDR, reloads on each request or handshake, and fails closed if
+  the file becomes unavailable or invalid.
+- **Automatic opt-out check:** Enrollment reads the current training setting and
+  sends the opt-out update only when training is enabled. Browser, device, and
+  web enrollment share this flow, with no manual bypass flag.
+- **Portable setup and expanded coverage:** Deployment defaults use the current
+  user's home/XDG directories, local credentials and state are ignored by Git,
+  and regression tests cover the added forwarding, access-policy, enrollment,
+  and account-affinity behavior.
+
 ## How it works
 
 1. Add ChatGPT accounts to the pool through browser or device login. The proxy
